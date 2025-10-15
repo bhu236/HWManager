@@ -9,3 +9,6 @@ google-generativeai
 typing-extensions
 PyPDF2
 pandas
+numpy
+sentence-transformers
+faiss-cpu
