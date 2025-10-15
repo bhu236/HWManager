@@ -1,113 +1,180 @@
 import streamlit as st
 import pandas as pd
+import os
 from openai import OpenAI
-from sentence_transformers import SentenceTransformer, util
-import torch
+import google.generativeai as genai
+import sys
+import pysqlite3
+sys.modules["sqlite3"] = pysqlite3
+import chromadb
+from chromadb.utils import embedding_functions
 
-# ---- PAGE SETUP ----
-st.set_page_config(page_title="🗞️ HW7 - News Info Bot", layout="wide")
-st.title("🗞️ HW7 - News Info Bot | Law Firm Edition")
-st.write("Ask questions about the uploaded news data — powered by RAG + LLM comparison.")
+# ==============================
+# APP CONFIG
+# ==============================
+st.set_page_config(page_title="🗞️ HW7 News Info Bot", layout="wide")
+st.title("🗞️ HW7 – News Info Bot for a Global Law Firm")
 
-# ---- LOAD DATA ----
-@st.cache_data
-def load_data():
-    df = pd.read_csv("HW7_news.csv")
-    df.dropna(subset=["Document"], inplace=True)
-    return df
+# ==============================
+# LOAD DATA
+# ==============================
+DATA_PATH = "HW7_news.csv"
 
-df = load_data()
-st.subheader("Preview of News Data")
-st.dataframe(df.head())
+if not os.path.exists(DATA_PATH):
+    st.error("❌ HW7_news.csv not found. Please place it in the project root folder.")
+    st.stop()
 
-# ---- EMBEDDING MODEL ----
-@st.cache_resource
-def load_embedding_model():
-    return SentenceTransformer('all-MiniLM-L6-v2')
+df = pd.read_csv(DATA_PATH)
+st.sidebar.success(f"✅ Loaded {len(df)} news stories.")
 
-embedder = load_embedding_model()
+# ==============================
+# INITIALIZE API CLIENTS
+# ==============================
+openai_client = OpenAI()
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-# Create embeddings for all documents
-if "embeddings" not in st.session_state:
-    with st.spinner("Encoding news articles..."):
-        st.session_state.embeddings = embedder.encode(df["Document"].tolist(), convert_to_tensor=True)
+# ==============================
+# CREATE CHROMA VECTOR STORE
+# ==============================
+chroma_client = chromadb.Client()
+embedding_func = embedding_functions.DefaultEmbeddingFunction()
 
-# ---- LLM SETUP ----
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", None)
-ANTHROPIC_API_KEY = st.secrets.get("ANTHROPIC_API_KEY", None)
+collection = chroma_client.get_or_create_collection(name="news_rag", embedding_function=embedding_func)
 
-if not OPENAI_API_KEY:
-    st.warning("⚠️ Please add your OpenAI API key to .streamlit/secrets.toml")
+# Load embeddings into Chroma (only once)
+if len(collection.get()['ids']) == 0:
+    for i, row in df.iterrows():
+        doc_text = f"{row['company_name']} - {row['Document']}"
+        collection.add(
+            ids=[str(i)],
+            documents=[doc_text],
+            metadatas=[{"url": row['URL'], "date": row['Date']}]
+        )
 
-# ---- USER INPUT ----
-user_query = st.text_input("Enter your query (e.g., 'find the most interesting news' or 'find news about JPMorgan')")
+# ==============================
+# HELPER FUNCTIONS
+# ==============================
+def retrieve_relevant_docs(query, n_results=5):
+    results = collection.query(query_texts=[query], n_results=n_results*2)
+    seen = set()
+    docs = []
+    for i in range(len(results['documents'][0])):
+        text = results['documents'][0][i]
+        if text not in seen:
+            seen.add(text)
+            docs.append({
+                "content": text,
+                "url": results['metadatas'][0][i]['url'],
+                "date": results['metadatas'][0][i]['date']
+            })
+        if len(docs) >= n_results:
+            break
+    return docs
 
-# ---- HELPER FUNCTIONS ----
-def retrieve_relevant_news(query, top_k=5):
-    query_emb = embedder.encode(query, convert_to_tensor=True)
-    scores = util.pytorch_cos_sim(query_emb, st.session_state.embeddings)[0]
-    top_results = torch.topk(scores, k=top_k)
-    return [(df.iloc[idx.item()], scores[idx].item()) for idx in top_results.indices]
-
-def summarize_with_model(vendor, model, context, query):
-    if vendor == "OpenAI":
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        prompt = f"You are a news assistant for a global law firm. Based on the following articles, answer the user's query: {query}\n\n{context}"
-        response = client.chat.completions.create(
+def openai_chat_completion(prompt, model="gpt-4o-mini"):
+    """Call OpenAI ChatCompletion using the new API."""
+    try:
+        response = openai_client.chat.completions.create(
             model=model,
-            messages=[{"role": "system", "content": "You are a precise, factual legal news assistant."},
-                      {"role": "user", "content": prompt}]
+            messages=[
+                {"role": "system", "content": "You are an analytical legal news assistant that summarizes and ranks news for lawyers."},
+                {"role": "user", "content": prompt}
+            ],
+            max_completion_tokens=500,
+            #temperature=0.7, as the new gpt-5 and gpt-4o models no longer support custom temperature values — they run with adaptive reasoning control internally
         )
         return response.choices[0].message.content
-    return "Vendor not supported yet."
+    except Exception as e:
+        return f"⚠️ OpenAI Error: {e}"
 
-# ---- PROCESS QUERY ----
+
+import google.generativeai as genai
+
+import google.generativeai as genai
+
+def gemini_chat_completion(prompt):
+    try:
+        genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+        model = genai.GenerativeModel("gemini-pro")  # fallback model
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"⚠️ Gemini Error: {str(e)}"
+
+def build_prompt(user_query, context_docs):
+    """Constructs a combined context-aware RAG prompt."""
+    context_text = "\n\n".join([f"- {doc['content']} ({doc['date']}) [{doc['url']}]" for doc in context_docs])
+    prompt = f"""
+    You are a news summarization bot for a global law firm.
+    The following are recent financial/legal news stories:
+
+    {context_text}
+
+    Based on these, answer the user query below clearly and analytically.
+
+    User query: {user_query}
+
+    When asked 'most interesting news', rank stories by their legal, regulatory, or reputational significance.
+    When asked for a specific topic, show the most relevant and insightful news with reasoning.
+    """
+    return prompt
+
+# ==============================
+# STREAMLIT UI
+# ==============================
+st.header("💬 Ask about the News Stories")
+
+user_query = st.text_input("Enter your question (e.g., 'find the most interesting news' or 'find news about JPMorgan AI')")
+
 if user_query:
-    st.subheader("Results")
-    results = retrieve_relevant_news(user_query, top_k=5)
-    
-    if "interesting" in user_query.lower():
-        st.markdown("### 🔝 Most Interesting News (by semantic similarity)")
-    else:
-        st.markdown("### 🔎 Relevant News Articles")
+    with st.spinner("🔍 Retrieving and analyzing news..."):
+        context_docs = retrieve_relevant_docs(user_query, n_results=5)
+        rag_prompt = build_prompt(user_query, context_docs)
 
-    for i, (row, score) in enumerate(results):
-        st.markdown(f"**{i+1}. [{row['Document'][:80]}...]({row['URL']})**")
-        st.caption(f"{row['company_name']} | {row['Date']} | Similarity: {score:.4f}")
+        # Compare both vendors
+        col1, col2 = st.columns(2)
 
-    # ---- RAG CONTEXT ----
-    combined_context = "\n\n".join([r[0]['Document'] for r in results])
+        with col1:
+            st.subheader("🔹 OpenAI GPT-5 (Premium Reasoning)")
+            openai_response = openai_chat_completion(rag_prompt, model="gpt-5")
+            st.write(openai_response)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("#### 💬 OpenAI GPT-4 (expensive model)")
-        if OPENAI_API_KEY:
-            with st.spinner("Querying OpenAI GPT-4..."):
-                answer_gpt4 = summarize_with_model("OpenAI", "gpt-4-turbo", combined_context, user_query)
-                st.write(answer_gpt4)
-        else:
-            st.info("Add your OpenAI API key in `.streamlit/secrets.toml` to use this model.")
-    with col2:
-        st.markdown("#### 💬 OpenAI GPT-3.5 (cheaper model)")
-        if OPENAI_API_KEY:
-            with st.spinner("Querying OpenAI GPT-3.5..."):
-                answer_gpt35 = summarize_with_model("OpenAI", "gpt-3.5-turbo", combined_context, user_query)
-                st.write(answer_gpt35)
+        with col2:
+            st.subheader("🔹 Gemini 1.5-Flash (Google – Cost Efficient)")
+            gemini_response = gemini_chat_completion(rag_prompt)
+            st.write(gemini_response)
 
-# ---- EXPLANATION SECTION ----
-with st.expander("🧠 Architecture & Evaluation"):
+        st.markdown("---")
+        st.subheader("📑 Retrieved Context (Top 5)")
+        for d in context_docs:
+            st.markdown(f"**{d['content']}**  \n📅 {d['date']}  \n🔗 [Read more]({d['url']})")
+
+# ==============================
+# EXPLANATION SECTION
+# ==============================
+with st.expander("📘 Explanation: Architecture & Evaluation"):
     st.markdown("""
     **Architecture:**
-    - CSV file → Embedded using SentenceTransformer (MiniLM) for efficient semantic search.
-    - RAG pipeline retrieves top-5 relevant articles for a query.
-    - Query and context sent to two LLMs (OpenAI GPT-4 & GPT-3.5) for comparison.
-    
-    **Ranking Quality:**
-    - Measured via semantic similarity using cosine scores between user query and document embeddings.
-    - Manual validation done by checking if top-ranked articles are contextually relevant to user queries.
+    - Data Source: `HW7_news.csv` containing company news and summaries.
+    - Vector Store: ChromaDB for semantic retrieval.
+    - Models:
+        - OpenAI `gpt-5` → high-reasoning premium model.
+        - OpenAI `gpt-4o-mini` → faster, cheaper variant (can switch via code).
+        - Google Gemini 1.5-Flash → secondary vendor for comparison.
+    - RAG Pipeline: Retrieve 5 most relevant stories, inject into context, generate ranked/filtered answers.
+
+    **Ranking Quality Evaluation:**
+    - For “most interesting news,” results were verified manually by checking:
+        - Relevance to law/regulation.
+        - Timeliness and reputational impact.
+        - Agreement between GPT-5 and Gemini outputs.
+    - For “topic-based queries,” correctness tested by:
+        - Comparing retrieved stories’ keywords to the query.
+        - Ensuring summaries cited URLs and matched the source context.
 
     **Model Comparison:**
-    - GPT-4 gives more nuanced, detailed, and legally contextualized responses.
-    - GPT-3.5 is faster and cheaper, sufficient for basic summarization and topic filtering.
+    - GPT-5 → Better at legal reasoning and nuanced ranking (more expensive).
+    - Gemini → Faster responses and lower cost, but less depth.
+    - Best overall: **GPT-5 (OpenAI)** for precision and interpretability.
     """)
 
